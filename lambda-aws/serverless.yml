@@ -1,0 +1,239 @@
+service: aws-lambda
+
+plugins:
+  - serverless-offline
+
+provider:
+  name: aws
+  runtime: nodejs12.x
+
+# you can overwrite defaults here
+  stage: dev
+  region: sa-east-1
+  apiGateway:
+    shouldStartNameWithService: true
+  environment:
+    USERS: 'USERS_${opt:stage, self:provider.stage}'
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:PutItem
+            - dynamodb:DeleteItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+          Resource: 'arn:aws:dynamodb:${opt:region, self:provider.region}:*:table/${self:provider.environment.USERS}'
+
+functions:
+
+  listarUsers:
+    handler: handler.listarUsers
+    events:
+      - http:
+          path: users
+          method: get
+          authorizer: aws_iam
+          cors: true
+
+  obterUser:
+    handler: handler.obterUser
+    events:
+      - http:
+          path: users/{userID}
+          method: get
+          authorizer: aws_iam
+          cors: true
+
+  cadastrarUser:
+    handler: handler.cadastrarUser
+    events:
+      - http:
+          path: users
+          method: post
+          authorizer: aws_iam
+          cors: true
+
+  atualizarUser:
+    handler: handler.atualizarUser
+    events:
+      - http:
+          path: users/{userID}
+          method: put
+          authorizer: aws_iam
+          cors: true
+
+  excluirUser:
+    handler: handler.excluirUser
+    events:
+      - http:
+          path: users/{userID}
+          method: delete
+          authorizer: aws_iam
+          cors: true
+
+resources:
+  Resources:
+    PacientesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: USERS
+        AttributeDefinitions:
+          - AttributeName: user_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: user_id
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 1
+          WriteCapacityUnits: 1
+
+    UserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UsernameConfiguration: 
+          CaseSensitive: false
+        AutoVerifiedAttributes:
+          - email
+        UsernameAttributes:
+          - email
+        UserPoolName: social-pets-user-pool-${opt:stage, self:provider.stage, 'dev'}
+        Schema:
+          - Name: email
+            AttributeDataType: String
+            Mutable: false
+            Required: true
+          - Name: name
+            AttributeDataType: String
+            Mutable: true
+            Required: true
+
+    UserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        UserPoolId: !Ref UserPool
+        AllowedOAuthFlowsUserPoolClient: true
+        CallbackURLs:
+          - http://localhost:3001
+        AllowedOAuthFlows:
+          - code
+          - implicit
+        AllowedOAuthScopes:
+          - phone
+          - email
+          - openid
+          - profile
+        SupportedIdentityProviders:
+          - COGNITO
+
+    UserPoolDomain:
+      Type: AWS::Cognito::UserPoolDomain
+      Properties:
+        Domain: social-pets-${opt:stage, self:provider.stage, 'dev'}
+        UserPoolId: !Ref UserPool
+
+    IdentityPool:
+      Type: "AWS::Cognito::IdentityPool"
+      Properties:
+        IdentityPoolName: social-pets-identity-pool-${opt:stage, self:provider.stage, 'dev'}
+        AllowUnauthenticatedIdentities: true
+        CognitoIdentityProviders: 
+          - ClientId: !Ref UserPoolClient
+            ProviderName: !GetAtt UserPool.ProviderName
+
+# Create a role for unauthorized acces to AWS resources. 
+    CognitoUnAuthorizedRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        AssumeRolePolicyDocument: 
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal: 
+                Federated: "cognito-identity.amazonaws.com"
+              Action: 
+                - "sts:AssumeRoleWithWebIdentity"
+              Condition:
+                StringEquals: 
+                  "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+                "ForAnyValue:StringLike":
+                  "cognito-identity.amazonaws.com:amr": unauthenticated
+        Policies:
+          - PolicyName: "CognitoUnauthorizedPolicy"
+            PolicyDocument: 
+              Version: "2012-10-17"
+              Statement: 
+                - Effect: "Allow"
+                  Action:
+                    - "mobileanalytics:PutEvents"
+                    - "cognito-sync:*"
+                  Resource: "*"
+
+# Create a role for authorized acces to AWS resources. 
+    CognitoAuthorizedRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        AssumeRolePolicyDocument: 
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal: 
+                Federated: "cognito-identity.amazonaws.com"
+              Action: 
+                - "sts:AssumeRoleWithWebIdentity"
+              Condition:
+                StringEquals: 
+                  "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+                "ForAnyValue:StringLike":
+                  "cognito-identity.amazonaws.com:amr": authenticated
+        Policies:
+          - PolicyName: "CognitoAuthorizedPolicy"
+            PolicyDocument: 
+              Version: "2012-10-17"
+              Statement: 
+                - Effect: "Allow"
+                  Action:
+                    - "mobileanalytics:PutEvents"
+                    - "cognito-sync:*"
+                    - "cognito-identity:*"
+                  Resource: "*"
+                - Effect: "Allow"
+                  Action:
+                    - "execute-api:Invoke"
+                  Resource:
+                    Fn::Join:
+                      - ""
+                      - - "arn:aws:execute-api:${opt:region, self:provider.region, 'dev'}:*:"
+                        - Ref: ApiGatewayRestApi
+                        - "/*/*/*"
+
+    IdentityPoolRoleMapping:
+      Type: "AWS::Cognito::IdentityPoolRoleAttachment"
+      Properties:
+        IdentityPoolId: !Ref IdentityPool
+        Roles:
+          authenticated: !GetAtt CognitoAuthorizedRole.Arn
+          unauthenticated: !GetAtt CognitoUnAuthorizedRole.Arn
+
+  # API Gateway Errors
+    GatewayResponseDefault4XX:
+      Type: 'AWS::ApiGateway::GatewayResponse'
+      Properties:
+        ResponseParameters:
+            gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        ResponseType: DEFAULT_4XX
+        RestApiId:
+          Ref: 'ApiGatewayRestApi'
+    GatewayResponseDefault5XX:
+      Type: 'AWS::ApiGateway::GatewayResponse'
+      Properties:
+        ResponseParameters:
+            gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        ResponseType: DEFAULT_5XX
+        RestApiId:
+          Ref: 'ApiGatewayRestApi'
